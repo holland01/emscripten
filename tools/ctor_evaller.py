@@ -6,6 +6,7 @@ This is an LTO-like operation, and to avoid parsing the entire tree (we might fa
 
 import os, sys, json, subprocess
 import shared, js_optimizer
+from tempfiles import try_delete
 
 js_file = sys.argv[1]
 mem_init_file = sys.argv[2]
@@ -16,12 +17,6 @@ global_base = int(sys.argv[5])
 assert global_base > 0
 
 config = shared.Configuration()
-
-if shared.DEBUG:
-  temp_file = os.path.join(shared.CANONICAL_TEMP_DIR, 'ctorEval.js')
-  shared.safe_ensure_dirs(shared.CANONICAL_TEMP_DIR)
-else:
-  temp_file = config.get_temp_files().get('.ctorEval.js').name
 
 # helpers
 
@@ -66,6 +61,8 @@ def eval_ctors(js, mem_init, num):
   asm = get_asm(js)
   assert len(asm) > 0
   asm = asm.replace('use asm', 'not asm') # don't try to validate this
+  # Substitute sbrk with a failing stub: the dynamic heap memory area shouldn't get increased during static ctor initialization.
+  asm = asm.replace('function _sbrk(', 'function _sbrk(increment) { throw "no sbrk when evalling ctors!"; } function KILLED_sbrk(', 1)
   # find all global vars, and provide only safe ones. Also add dumping for those.
   pre_funcs_start = asm.find(';') + 1
   pre_funcs_end = asm.find('function ', pre_funcs_start)
@@ -80,13 +77,13 @@ def eval_ctors(js, mem_init, num):
     for bit in bits:
       name, value = map(lambda x: x.strip(), bit.split('='))
       if value in ['0', '+0', '0.0'] or name in [
-        'STACKTOP', 'STACK_MAX', 'DYNAMICTOP',
+        'STACKTOP', 'STACK_MAX', 'DYNAMICTOP_PTR',
         'HEAP8', 'HEAP16', 'HEAP32',
         'HEAPU8', 'HEAPU16', 'HEAPU32',
         'HEAPF32', 'HEAPF64',
         'Int8View', 'Int16View', 'Int32View', 'Uint8View', 'Uint16View', 'Uint32View', 'Float32View', 'Float64View',
         'nan', 'inf',
-        '_emscripten_memcpy_big', '_sbrk', '___dso_handle',
+        '_emscripten_memcpy_big', '___dso_handle',
         '_atexit', '___cxa_atexit',
       ] or name.startswith('Math_'):
         if 'new ' not in value:
@@ -101,12 +98,19 @@ def eval_ctors(js, mem_init, num):
   static_bump = int(js[static_bump_start + len(static_bump_op):static_bump_end])
   # Generate a safe sandboxed environment. We replace all ffis with errors. Otherwise,
   # asm.js can't call outside, so we are ok.
-  open(temp_file, 'w').write('''
+#  if shared.DEBUG:
+#    temp_file = os.path.join(shared.CANONICAL_TEMP_DIR, 'ctorEval.js')
+#    shared.safe_ensure_dirs(shared.CANONICAL_TEMP_DIR)
+#  else:
+#    temp_file = config.get_temp_files().get('.ctorEval.js').name
+  with config.get_temp_files().get_file('.ctorEval.js') as temp_file:
+    open(temp_file, 'w').write('''
 var totalMemory = %d;
 var totalStack = %d;
 
 var buffer = new ArrayBuffer(totalMemory);
 var heap = new Uint8Array(buffer);
+var heapi32 = new Int32Array(buffer);
 
 var memInit = %s;
 
@@ -124,7 +128,8 @@ var stackBase = stackTop;
 var stackMax = stackTop + totalStack;
 if (stackMax >= totalMemory) throw 'not enough room for stack';
 
-var dynamicTop = stackMax;
+var dynamicTopPtr = stackMax;
+heapi32[dynamicTopPtr >> 2] = stackMax;
 
 if (!Math.imul) {
   Math.imul = Math.imul || function(a, b) {
@@ -161,7 +166,7 @@ var globalArg = {
 var libraryArg = {
   STACKTOP: stackTop,
   STACK_MAX: stackMax,
-  DYNAMICTOP: dynamicTop,
+  DYNAMICTOP_PTR: dynamicTopPtr,
   ___dso_handle: 0, // used by atexit, value doesn't matter
   _emscripten_memcpy_big: function(dest, src, num) {
     heap.set(heap.subarray(src, src+num), dest);
@@ -197,6 +202,10 @@ for (var i = 0; i < allCtors.length; i++) {
       console.warn('globals modified');
       break;
     }
+    if (heapi32[dynamicTopPtr >> 2] !== stackMax) {
+      console.warn('dynamic allocation was performend');
+      break;
+    }
 
     // this one was ok.
     numSuccessful = i + 1;
@@ -213,25 +222,38 @@ while (newSize > globalBase && heap[newSize-1] == 0) newSize--;
 console.log(JSON.stringify([numSuccessful, Array.prototype.slice.call(heap.subarray(globalBase, newSize)), atexits]));
 
 ''' % (total_memory, total_stack, mem_init, global_base, static_bump, asm, json.dumps(ctors)))
-  # Execute the sandboxed code. If an error happened due to calling an ffi, that's fine,
-  # us exiting with an error tells the caller that we failed. If it times out, give up.
-  out_file = config.get_temp_files().get('.out').name
-  err_file = config.get_temp_files().get('.err').name
-  proc = subprocess.Popen(shared.NODE_JS + [temp_file], stdout=open(out_file, 'w'), stderr=open(err_file, 'w'))
-  try:
-    shared.jsrun.timeout_run(proc, timeout=10, full_output=True)
-    if proc.returncode != 0:
-      shared.logging.debug('unexpected error while trying to eval ctors:\n' + open(err_file).read())
+
+    def read_and_delete(filename):
+      result = ''
+      try:
+        result = open(filename, 'r').read()
+      finally:
+        try_delete(filename)
+      return result
+
+    # Execute the sandboxed code. If an error happened due to calling an ffi, that's fine,
+    # us exiting with an error tells the caller that we failed. If it times out, give up.
+    out_file = config.get_temp_files().get('.out').name
+    err_file = config.get_temp_files().get('.err').name
+    proc = subprocess.Popen(shared.NODE_JS + [temp_file], stdout=open(out_file, 'w'), stderr=open(err_file, 'w'))
+    try:
+      shared.jsrun.timeout_run(proc, timeout=10, full_output=True)
+    except Exception, e:
+      if 'Timed out' not in str(e): raise e
+      shared.logging.debug('ctors timed out\n')
       return (0, 0, 0, 0)
-  except Exception, e:
-    if 'Timed out' not in str(e): raise e
-    shared.logging.debug('ctors timed out\n')
-    return (0, 0, 0, 0)
+    finally:
+      out_result = read_and_delete(out_file)
+      err_result = read_and_delete(err_file)
+    if proc.returncode != 0:
+      shared.logging.debug('unexpected error while trying to eval ctors:\n' + out_result + '\n' + err_result)
+      return (0, 0, 0, 0)
+
   # out contains the new mem init and other info
-  num_successful, mem_init_raw, atexits = json.loads(open(out_file).read())
+  num_successful, mem_init_raw, atexits = json.loads(out_result)
   mem_init = ''.join(map(chr, mem_init_raw))
   if num_successful < total_ctors:
-    shared.logging.debug('not all ctors could be evalled, something was used that was not safe (and therefore was not defined, and caused an error):\n========\n' + open(err_file).read() + '========')
+    shared.logging.debug('not all ctors could be evalled, something was used that was not safe (and therefore was not defined, and caused an error):\n========\n' + err_result + '========')
   # Remove the evalled ctors, add a new one for atexits if needed, and write that out
   if len(ctors) == total_ctors and len(atexits) == 0:
     new_ctors = ''

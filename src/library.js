@@ -428,28 +428,111 @@ LibraryManager.library = {
     ___setErrNo(ERRNO_CODES.EINVAL);
     return -1;
   },
-  sbrk: function(bytes) {
+
+  // Implement a Linux-like 'memory area' for our 'process'.
+  // Changes the size of the memory area by |bytes|; returns the
+  // address of the previous top ('break') of the memory area
+  // We control the "dynamic" memory - DYNAMIC_BASE to DYNAMICTOP
+  sbrk__asm: true,
+  sbrk__sig: ['ii'],
+  sbrk__deps: ['__setErrNo'],
+  sbrk: function(increment) {
+    increment = increment|0;
+    var oldDynamicTop = 0;
+    var oldDynamicTopOnChange = 0;
+    var newDynamicTop = 0;
+    var totalMemory = 0;
+    increment = ((increment + 15) & -16)|0;
 #if USE_PTHREADS
-    if (ENVIRONMENT_IS_PTHREAD) return _emscripten_sync_run_in_main_thread_1({{{ cDefine('EM_PROXIED_SBRK') }}}, bytes);
+    totalMemory = getTotalMemory()|0;
+
+    // Perform a compare-and-swap loop to update the new dynamic top value. This is because
+    // this function can becalled simultaneously in multiple threads.
+    do {
+      oldDynamicTop = Atomics_load(HEAP32, DYNAMICTOP_PTR>>2);
+      newDynamicTop = oldDynamicTop + increment | 0;
+      // Asking to increase dynamic top to a too high value? In pthreads builds we cannot
+      // enlarge memory, so this needs to fail.
+      if (((increment|0) > 0 & (newDynamicTop|0) < (oldDynamicTop|0)) // Detect and fail if we would wrap around signed 32-bit int.
+        | (newDynamicTop|0) < 0 // Also underflow, sbrk() should be able to be used to subtract.
+        | (newDynamicTop|0) > (totalMemory|0)) {
+#if ABORTING_MALLOC
+        abortOnCannotGrowMemory()|0;
+#else
+        ___setErrNo({{{ cDefine('ENOMEM') }}});
+        return -1;
 #endif
-    // Implement a Linux-like 'memory area' for our 'process'.
-    // Changes the size of the memory area by |bytes|; returns the
-    // address of the previous top ('break') of the memory area
-    // We control the "dynamic" memory - DYNAMIC_BASE to DYNAMICTOP
-    var self = _sbrk;
-    if (!self.called) {
-      DYNAMICTOP = alignMemoryPage(DYNAMICTOP); // make sure we start out aligned
-      self.called = true;
-      assert(Runtime.dynamicAlloc);
-      self.alloc = Runtime.dynamicAlloc;
-      Runtime.dynamicAlloc = function() { abort('cannot dynamically allocate, sbrk now has control') };
+      }
+      // Attempt to update the dynamic top to new value. Another thread may have beat this thread to the update,
+      // in which case we will need to start over by iterating the loop body again.
+      oldDynamicTopOnChange = Atomics_compareExchange(HEAP32, DYNAMICTOP_PTR>>2, oldDynamicTop|0, newDynamicTop|0);
+    } while((oldDynamicTopOnChange|0) != (oldDynamicTop|0));
+#else // singlethreaded build: (-s USE_PTHREADS=0)
+    oldDynamicTop = HEAP32[DYNAMICTOP_PTR>>2]|0;
+    newDynamicTop = oldDynamicTop + increment | 0;
+
+    if (((increment|0) > 0 & (newDynamicTop|0) < (oldDynamicTop|0)) // Detect and fail if we would wrap around signed 32-bit int.
+      | (newDynamicTop|0) < 0) { // Also underflow, sbrk() should be able to be used to subtract.
+#if ABORTING_MALLOC
+      abortOnCannotGrowMemory()|0;
+#endif
+      ___setErrNo({{{ cDefine('ENOMEM') }}});
+      return -1;
     }
-    var ret = DYNAMICTOP;
-    if (bytes != 0) {
-      var success = self.alloc(bytes);
-      if (!success) return -1 >>> 0; // sbrk failure code
+
+    HEAP32[DYNAMICTOP_PTR>>2] = newDynamicTop;
+    totalMemory = getTotalMemory()|0;
+    if ((newDynamicTop|0) > (totalMemory|0)) {
+      if ((enlargeMemory()|0) == 0) {
+        ___setErrNo({{{ cDefine('ENOMEM') }}});
+        HEAP32[DYNAMICTOP_PTR>>2] = oldDynamicTop;
+        return -1;
+      }
     }
-    return ret;  // Previous break location.
+#endif
+    return oldDynamicTop|0;
+  },
+
+  brk__asm: true,
+  brk__sig: ['ii'],
+  brk: function(newDynamicTop) {
+    newDynamicTop = newDynamicTop|0;
+    var oldDynamicTop = 0;
+    var totalMemory = 0;
+#if USE_PTHREADS
+    totalMemory = getTotalMemory()|0;
+    // Asking to increase dynamic top to a too high value? In pthreads builds we cannot
+    // enlarge memory, so this needs to fail.
+    if ((newDynamicTop|0) < 0 | (newDynamicTop|0) > (totalMemory|0)) {
+#if ABORTING_MALLOC
+      abortOnCannotGrowMemory()|0;
+#else
+      ___setErrNo({{{ cDefine('ENOMEM') }}});
+      return -1;
+#endif
+    }
+    Atomics_store(HEAP32, DYNAMICTOP_PTR>>2, newDynamicTop|0);
+#else // singlethreaded build: (-s USE_PTHREADS=0)
+    if ((newDynamicTop|0) < 0) {
+#if ABORTING_MALLOC
+      abortOnCannotGrowMemory()|0;
+#endif
+      ___setErrNo({{{ cDefine('ENOMEM') }}});
+      return -1;
+    }
+
+    oldDynamicTop = HEAP32[DYNAMICTOP_PTR>>2]|0;
+    HEAP32[DYNAMICTOP_PTR>>2] = newDynamicTop;
+    totalMemory = getTotalMemory()|0;
+    if ((newDynamicTop|0) > (totalMemory|0)) {
+      if ((enlargeMemory()|0) == 0) {
+        ___setErrNo({{{ cDefine('ENOMEM') }}});
+        HEAP32[DYNAMICTOP_PTR>>2] = oldDynamicTop;
+        return -1;
+      }
+    }
+#endif
+    return 0;
   },
 
   system__deps: ['__setErrNo', '$ERRNO_CODES'],
@@ -916,18 +999,24 @@ LibraryManager.library = {
     {{{ makeStructuralReturn(['ret', '0']) }}};
   },
 
+  llvm_ctpop_i32__asm: true,
+  llvm_ctpop_i32__sig: 'ii',
   llvm_ctpop_i32: function(x) {
-    var ret = 0;
-    while (x) {
-      if (x&1) ret++;
-      x >>>= 1;
-    }
-    return ret;
+    // http://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
+    // http://bits.stephan-brumme.com/countBits.html
+    x = x | 0;
+    x = x - ((x >>> 1) & 0x55555555) | 0;
+    x = (x & 0x33333333) + ((x >>> 2) & 0x33333333) | 0;
+    return (Math_imul((x + (x >>> 4) & 252645135 /* 0xF0F0F0F, but hits uglify parse bug? */), 0x1010101) >>> 24) | 0;
   },
 
   llvm_ctpop_i64__deps: ['llvm_ctpop_i32'],
+  llvm_ctpop_i64__asm: true,
+  llvm_ctpop_i64__sig: 'iii',
   llvm_ctpop_i64: function(l, h) {
-    return _llvm_ctpop_i32(l) + _llvm_ctpop_i32(h);
+    l = l | 0;
+    h = h | 0;
+    return (_llvm_ctpop_i32(l) | 0) + (_llvm_ctpop_i32(h) | 0) | 0;
   },
 
   llvm_trap: function() {
@@ -983,7 +1072,12 @@ LibraryManager.library = {
       info.refcount--;
       if (info.refcount === 0) {
         if (info.destructor) {
+#if WASM_BACKEND == 0
           Runtime.dynCall('vi', info.destructor, [ptr]);
+#else
+          // In Wasm, destructors return 'this' as in ARM
+          Runtime.dynCall('ii', info.destructor, [ptr]);
+#endif
         }
         delete EXCEPTIONS.infos[ptr];
         ___cxa_free_exception(ptr);
@@ -1035,7 +1129,8 @@ LibraryManager.library = {
       adjusted: ptr,
       type: type,
       destructor: destructor,
-      refcount: 0
+      refcount: 0,
+      caught: false
     };
     EXCEPTIONS.last = ptr;
     if (!("uncaught_exception" in __ZSt18uncaught_exceptionv)) {
@@ -1076,7 +1171,11 @@ LibraryManager.library = {
   },
   __cxa_begin_catch__deps: ['_ZSt18uncaught_exceptionv', '$EXCEPTIONS'],
   __cxa_begin_catch: function(ptr) {
-    __ZSt18uncaught_exceptionv.uncaught_exception--;
+    var info = EXCEPTIONS.infos[ptr];
+    if (info && !info.caught) {
+      info.caught = true;
+      __ZSt18uncaught_exceptionv.uncaught_exception--;
+    }
     EXCEPTIONS.caught.push(ptr);
 #if EXCEPTION_DEBUG
 		Module.printErr('cxa_begin_catch ' + [ptr, 'stack', EXCEPTIONS.caught]);
@@ -1356,10 +1455,20 @@ LibraryManager.library = {
   llvm_log_f64: 'Math_log',
   llvm_exp_f32: 'Math_exp',
   llvm_exp_f64: 'Math_exp',
+  llvm_sin_f32: 'Math_sin',
+  llvm_sin_f64: 'Math_sin',
   llvm_trunc_f32: 'Math_trunc',
   llvm_trunc_f64: 'Math_trunc',
   llvm_floor_f32: 'Math_floor',
   llvm_floor_f64: 'Math_floor',
+
+  llvm_copysign_f32: function(x, y) {
+    return y < 0 || (y === 0 && 1/y < 0) ? -Math_abs(x) : Math_abs(x);
+  },
+
+  llvm_copysign_f64: function(x, y) {
+    return y < 0 || (y === 0 && 1/y < 0) ? -Math_abs(x) : Math_abs(x);
+  },
 
   round__asm: true,
   round__sig: 'dd',
@@ -1730,7 +1839,12 @@ LibraryManager.library = {
         (date.tm_min < 10 ? ':0' : ':') + date.tm_min +
         (date.tm_sec < 10 ? ':0' : ':') + date.tm_sec +
         ' ' + (1900 + date.tm_year) + "\n";
-    writeStringToMemory(s, buf);
+
+    // asctime_r is specced to behave in an undefined manner if the algorithm would attempt
+    // to write out more than 26 bytes (including the null terminator).
+    // See http://pubs.opengroup.org/onlinepubs/9699919799/functions/asctime.html
+    // Our undefined behavior is to truncate the write to at most 26 bytes, including null terminator.
+    stringToUTF8(s, buf, 26);
     return buf;
   },
 
@@ -2520,9 +2634,23 @@ LibraryManager.library = {
   // setjmp.h
   // ==========================================================================
 
+  // asm.js-style setjmp/longjmp support for wasm binaryen backend.
+  // In asm.js compilation, various variables including setjmpId will be
+  // generated within 'var asm' in emscripten.py, while in wasm compilation,
+  // wasm side is considered as 'asm' so they are not generated. But
+  // saveSetjmp() needs setjmpId and no other functions in wasm side needs it.
+  // So we declare it here if WASM_BACKEND=1.
+#if WASM_BACKEND == 1
+  $setjmpId: 0,
+#endif
+
   saveSetjmp__asm: true,
   saveSetjmp__sig: 'iii',
+#if WASM_BACKEND == 1
+  saveSetjmp__deps: ['realloc', '$setjmpId'],
+#else
   saveSetjmp__deps: ['realloc'],
+#endif
   saveSetjmp: function(env, label, table, size) {
     // Not particularly fast: slow table lookup of setjmpId to label. But setjmp
     // prevents relooping anyhow, so slowness is to be expected. And typical case
@@ -3214,7 +3342,7 @@ LibraryManager.library = {
     // generate hostent
     var ret = _malloc({{{ C_STRUCTS.hostent.__size__ }}}); // XXX possibly leaked, as are others here
     var nameBuf = _malloc(name.length+1);
-    writeStringToMemory(name, nameBuf);
+    stringToUTF8(name, nameBuf, name.length+1);
     {{{ makeSetValue('ret', C_STRUCTS.hostent.h_name, 'nameBuf', 'i8*') }}};
     var aliasesBuf = _malloc(4);
     {{{ makeSetValue('aliasesBuf', '0', '0', 'i8*') }}};
@@ -3421,6 +3549,8 @@ LibraryManager.library = {
     var port = info.port;
     var addr = info.addr;
 
+    var overflowed = false;
+
     if (node && nodelen) {
       var lookup;
       if ((flags & {{{ cDefine('NI_NUMERICHOST') }}}) || !(lookup = DNS.lookup_addr(addr))) {
@@ -3430,18 +3560,25 @@ LibraryManager.library = {
       } else {
         addr = lookup;
       }
-      if (addr.length >= nodelen) {
-        return {{{ cDefine('EAI_OVERFLOW') }}};
+      var numBytesWrittenExclNull = stringToUTF8(addr, node, nodelen);
+
+      if (numBytesWrittenExclNull+1 >= nodelen) {
+        overflowed = true;
       }
-      writeStringToMemory(addr, node);
     }
 
     if (serv && servlen) {
       port = '' + port;
-      if (port.length > servlen) {
-        return {{{ cDefine('EAI_OVERFLOW') }}};
+      var numBytesWrittenExclNull = stringToUTF8(port, serv, servlen);
+
+      if (numBytesWrittenExclNull+1 >= servlen) {
+        overflowed = true;
       }
-      writeStringToMemory(port, serv);
+    }
+
+    if (overflowed) {
+      // Note: even when we overflow, getnameinfo() is specced to write out the truncated results.
+      return {{{ cDefine('EAI_OVERFLOW') }}};
     }
 
     return 0;
@@ -3628,7 +3765,7 @@ LibraryManager.library = {
       me.bufferSize = s.length+1;
       me.buffer = _malloc(me.bufferSize);
     }
-    writeStringToMemory(s, me.buffer);
+    stringToUTF8(s, me.buffer, me.bufferSize);
     return me.buffer;
   },
 
@@ -3806,17 +3943,13 @@ LibraryManager.library = {
     var callstack = _emscripten_get_callstack_js(flags);
     // User can query the required amount of bytes to hold the callstack.
     if (!str || maxbytes <= 0) {
-      return callstack.length+1;
-    }
-    // Truncate output to avoid writing past bounds.
-    if (callstack.length > maxbytes-1) {
-      callstack = callstack.slice(0, maxbytes-1);
+      return lengthBytesUTF8(callstack)+1;
     }
     // Output callstack string as C string to HEAP.
-    writeStringToMemory(callstack, str, false);
+    var bytesWrittenExcludingNull = stringToUTF8(callstack, str, maxbytes);
 
-    // Return number of bytes written.
-    return callstack.length+1;
+    // Return number of bytes written, including null.
+    return bytesWrittenExcludingNull+1;
   },
 
   emscripten_log_js__deps: ['emscripten_get_callstack_js'],
@@ -3876,10 +4009,8 @@ LibraryManager.library = {
 
   emscripten_print_double: function(x, to, max) {
     var str = x + '';
-    var ret = str.length;
-    if (str.length + 1 > max) str = str.substring(0, max - 1);
-    if (to) writeStringToMemory(str, to);
-    return ret;
+    if (to) return stringToUTF8(str, to, max);
+    else return lengthBytesUTF8(str);
   },
 
   //============================
@@ -3992,8 +4123,10 @@ LibraryManager.library = {
     return 0; // we cannot succeed
   },
 
+  _Unwind_RaiseException__deps: ['__cxa_throw'],
   _Unwind_RaiseException: function(ex) {
-    abort('Unwind_RaiseException');
+    Module.printErr('Warning: _Unwind_RaiseException is not correctly implemented');
+    return ___cxa_throw(ex, 0, 0);
   },
 
   _Unwind_DeleteException: function(ex) {
@@ -4047,6 +4180,8 @@ LibraryManager.library = {
   llvm_dbg_value: true,
   llvm_debugtrap: true,
   llvm_ctlz_i32: true,
+  llvm_maxnum_f32: true,
+  llvm_maxnum_f64: true,
   emscripten_asm_const: true,
   emscripten_asm_const_int: true,
   emscripten_asm_const_double: true,

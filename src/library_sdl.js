@@ -706,7 +706,7 @@ var LibrarySDL = {
             SDL.canRequestFullscreen = true;
           } else if (event.type === 'keyup' || event.type === 'mouseup') {
             if (SDL.isRequestingFullscreen) {
-              Module['requestFullScreen'](true, true);
+              Module['requestFullscreen'](/*lockPointer=*/true, /*resizeCanvas=*/true);
               SDL.isRequestingFullscreen = false;
             }
             SDL.canRequestFullscreen = false;
@@ -1739,7 +1739,7 @@ var LibrarySDL = {
   SDL_ShowCursor: function(toggle) {
     switch (toggle) {
       case 0: // SDL_DISABLE
-        if (Browser.isFullScreen) { // only try to lock the pointer when in full screen mode
+        if (Browser.isFullscreen) { // only try to lock the pointer when in full screen mode
           Module['canvas'].requestPointerLock();
           return 0;
         } else { // else return SDL_ENABLE to indicate the failure
@@ -2094,8 +2094,8 @@ var LibrarySDL = {
   SDL_WM_GrabInput: function() {},
   
   SDL_WM_ToggleFullScreen: function(surf) {
-    if (Browser.isFullScreen) {
-      Module['canvas'].cancelFullScreen();
+    if (Browser.isFullscreen) {
+      Module['canvas'].exitFullscreen();
       return 1;
     } else {
       if (!SDL.canRequestFullscreen) {
@@ -2170,8 +2170,9 @@ var LibrarySDL = {
         if (!raw) {
           if (raw === null) Module.printErr('Trying to reuse preloaded image, but freePreloadedMediaOnUse is set!');
 #if STB_IMAGE
-          var name = Module['_malloc'](lengthBytesUTF8(filename)+1);
-          writeStringToMemory(filename, name);
+          var lengthBytes = lengthBytesUTF8(filename)+1;
+          var name = Module['_malloc'](lengthBytes);
+          stringToUTF8(filename, name, lengthBytes);
           addCleanup(function() {
             Module['_free'](name);
           });
@@ -3207,7 +3208,7 @@ var LibrarySDL = {
   SDL_DestroyRenderer: function(renderer) {},
 
   SDL_GetWindowFlags: function(x, y) {
-    if (Browser.isFullScreen) {
+    if (Browser.isFullscreen) {
        return 1;
     }
 
@@ -3244,8 +3245,8 @@ var LibrarySDL = {
   SDL_LogSetOutputFunction: function(callback, userdata) {},
 
   SDL_SetWindowFullscreen: function(window, fullscreen) {
-    if (Browser.isFullScreen) {
-      Module['canvas'].cancelFullScreen();
+    if (Browser.isFullscreen) {
+      Module['canvas'].exitFullscreen();
       return 1;
     } else {
       return 0;

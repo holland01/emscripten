@@ -9,6 +9,7 @@ Not all changes are documented here. In particular, new features, user-oriented 
 
 Current trunk code
 ------------------
+ - Updated to libc++'s "v2" ABI, which provides better alignment for string data and other improvements. This is an ABI-incompatible change, so bitcode files from previous versions will not be compatible.
  - To see a list of commits in the active development branch 'incoming', which have not yet been packaged in a release, see
     - Emscripten: https://github.com/kripken/emscripten/compare/1.36.1...incoming
     - Emscripten-LLVM: https://github.com/kripken/emscripten-fastcomp/compare/1.36.1...incoming
@@ -381,6 +382,7 @@ v1.34.8: 9/9/2015
  - Update emrun to latest, which improves unit test run automation with emrun.
  - Added support for LZ4 compressing file packages, used with the -s LZ4=1 linker flag. (#3754)
  - Fixed noisy build warning on "unexpected number of arguments in call to strtold" (#3760)
+ - Added new linker flag --separate-asm that splits the asm.js module and the handwritten JS functions to separate files.
  - Full list of changes:
     - Emscripten: https://github.com/kripken/emscripten/compare/1.34.7...1.34.8
     - Emscripten-LLVM: no changes.
